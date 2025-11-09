@@ -5,29 +5,28 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"mime/multipart"
 	"net"
 	"net/http"
 	"os/exec"
+	"strings"
 	"sync"
 	"time"
 
 	"golang.org/x/net/proxy"
 )
 
-// Response is the simplified response used by the tool.
 type Response struct {
 	Status     string
 	StatusCode int
 	Body       string
 }
 
-// Stats contains aggregated results after bulk run.
 type Stats struct {
-	TotalPerStatus map[int]int    // status -> count
-	ExampleMessage map[int]string // sample message/body for that status
+	TotalPerStatus map[int]int
+	ExampleMessage map[int]string
 }
 
-// SendRequest sends a single HTTP request using provided client.
 func SendRequestWithClient(client *http.Client, method, url string, body []byte, headers map[string]string) (*Response, error) {
 	req, err := http.NewRequest(method, url, bytes.NewBuffer(body))
 	if err != nil {
@@ -49,34 +48,30 @@ func SendRequestWithClient(client *http.Client, method, url string, body []byte,
 	}, nil
 }
 
-// createClient optionally creates HTTP client that uses SOCKS5 at 127.0.0.1:9050 when useTor==true.
 func createClient(useTor bool) (*http.Client, error) {
 	if !useTor {
 		return &http.Client{Timeout: 20 * time.Second}, nil
 	}
-
-	// attempt to create a SOCKS5 dialer to Tor
 	dialer, err := proxy.SOCKS5("tcp", "127.0.0.1:9050", nil, proxy.Direct)
 	if err != nil {
 		return nil, fmt.Errorf("creating socks5 dialer: %w", err)
 	}
-	// Build a transport that uses the socks dialer
 	dialContext := func(ctx context.Context, network, addr string) (net.Conn, error) {
 		return dialer.Dial(network, addr)
 	}
-	transport := &http.Transport{
-		DialContext: dialContext,
-	}
-	return &http.Client{
-		Transport: transport,
-		Timeout:   30 * time.Second,
-	}, nil
+	transport := &http.Transport{DialContext: dialContext}
+	return &http.Client{Transport: transport, Timeout: 30 * time.Second}, nil
 }
 
-// SendMultipleRequests concurrently sends `count` requests. payloadGen(i) returns a map[field]value
-// which will be converted into a JSON-like body: {"Field1":"value1","Field2":"value2"}.
-// If you need custom formatting change here.
-func SendMultipleRequests(method, url string, headers map[string]string, payloadGen func(int) map[string]string, count, concurrency int, useTor bool) (*Stats, error) {
+func SendMultipleRequests(
+	method, url string,
+	headers map[string]string,
+	payloadGen func(int) map[string]string,
+	count, concurrency int,
+	useTor bool,
+	payloadType string,
+) (*Stats, error) {
+
 	if count <= 0 {
 		return nil, fmt.Errorf("invalid count")
 	}
@@ -89,41 +84,74 @@ func SendMultipleRequests(method, url string, headers map[string]string, payload
 		return nil, err
 	}
 
-	// results aggregation
-	stats := &Stats{
-		TotalPerStatus: map[int]int{},
-		ExampleMessage: map[int]string{},
-	}
+	stats := &Stats{TotalPerStatus: map[int]int{}, ExampleMessage: map[int]string{}}
 	var mu sync.Mutex
-
-	type job struct {
-		idx int
-	}
+	type job struct{ idx int }
 	jobs := make(chan job, count)
 	results := make(chan *Response, count)
 	errorsCh := make(chan error, count)
-
-	// worker
 	var wg sync.WaitGroup
+
 	worker := func() {
 		defer wg.Done()
 		for j := range jobs {
 			payloadMap := payloadGen(j.idx)
-			// create body as JSON-like map string
-			// Build a simple JSON body (no escaping implemented for brevity; if your data contains quotes, refine this)
-			bodyBuf := &bytes.Buffer{}
-			bodyBuf.WriteString("{")
-			first := true
-			for k, v := range payloadMap {
-				if !first {
-					bodyBuf.WriteString(",")
-				}
-				fmt.Fprintf(bodyBuf, `"%s":"%s"`, k, v)
-				first = false
-			}
-			bodyBuf.WriteString("}")
+			var bodyBytes []byte
+			var contentType string
 
-			resp, err := SendRequestWithClient(client, method, url, bodyBuf.Bytes(), headers)
+			switch payloadType {
+			case "json":
+				buf := &bytes.Buffer{}
+				buf.WriteString("{")
+				first := true
+				for k, v := range payloadMap {
+					if !first {
+						buf.WriteString(",")
+					}
+					fmt.Fprintf(buf, `"%s":"%s"`, k, v)
+					first = false
+				}
+				buf.WriteString("}")
+				bodyBytes = buf.Bytes()
+				contentType = "application/json"
+
+			case "form":
+				form := make([]string, 0, len(payloadMap))
+				for k, v := range payloadMap {
+					form = append(form, fmt.Sprintf("%s=%s", k, v))
+				}
+				bodyBytes = []byte(strings.Join(form, "&"))
+				contentType = "application/x-www-form-urlencoded"
+
+			case "multipart":
+				var b bytes.Buffer
+				w := multipart.NewWriter(&b)
+				for k, v := range payloadMap {
+					_ = w.WriteField(k, v)
+				}
+				w.Close()
+				bodyBytes = b.Bytes()
+				contentType = w.FormDataContentType()
+
+			case "binary":
+				for _, v := range payloadMap {
+					bodyBytes = []byte(v)
+					break
+				}
+				contentType = "application/octet-stream"
+
+			case "graphql":
+				query := payloadMap["query"]
+				bodyBytes = []byte(fmt.Sprintf(`{"query":"%s"}`, query))
+				contentType = "application/json"
+
+			default:
+				return
+			}
+
+			headers["Content-Type"] = contentType
+
+			resp, err := SendRequestWithClient(client, method, url, bodyBytes, headers)
 			if err != nil {
 				errorsCh <- err
 				continue
@@ -132,13 +160,11 @@ func SendMultipleRequests(method, url string, headers map[string]string, payload
 		}
 	}
 
-	// start workers
 	for i := 0; i < concurrency; i++ {
 		wg.Add(1)
 		go worker()
 	}
 
-	// enqueue jobs
 	go func() {
 		for i := 0; i < count; i++ {
 			jobs <- job{idx: i}
@@ -146,20 +172,17 @@ func SendMultipleRequests(method, url string, headers map[string]string, payload
 		close(jobs)
 	}()
 
-	// collect
 	go func() {
 		wg.Wait()
 		close(results)
 		close(errorsCh)
 	}()
 
-	// read responses and errors
 	processed := 0
 	for processed < count {
 		select {
 		case r, ok := <-results:
 			if !ok {
-				// results closed; drain errors
 				for err := range errorsCh {
 					_ = err
 				}
@@ -169,7 +192,6 @@ func SendMultipleRequests(method, url string, headers map[string]string, payload
 			mu.Lock()
 			stats.TotalPerStatus[r.StatusCode]++
 			if _, exists := stats.ExampleMessage[r.StatusCode]; !exists {
-				// store first body as example message (trim to 120 chars)
 				msg := r.Body
 				if len(msg) > 120 {
 					msg = msg[:120] + "..."
@@ -183,7 +205,6 @@ func SendMultipleRequests(method, url string, headers map[string]string, payload
 				processed = count
 				break
 			}
-			// treat network errors as status 0
 			mu.Lock()
 			stats.TotalPerStatus[0]++
 			if _, exists := stats.ExampleMessage[0]; !exists {
@@ -192,21 +213,17 @@ func SendMultipleRequests(method, url string, headers map[string]string, payload
 			mu.Unlock()
 			processed++
 		case <-time.After(1 * time.Second):
-			// prevent blocking if both channels are empty; continue until processed reaches count
 		}
 	}
 
 	return stats, nil
 }
 
-// InstallTorProxychains attempts to install tor and proxychains (Debian-based).
 func InstallTorProxychains() error {
-	// basic check: is apt-get present?
 	_, err := exec.LookPath("apt-get")
 	if err != nil {
 		return fmt.Errorf("apt-get not found; automatic install only supported on apt-based systems")
 	}
-	// run update + install (requires sudo)
 	cmd := exec.Command("bash", "-lc", "sudo apt-get update && sudo apt-get install -y tor proxychains")
 	out, err := cmd.CombinedOutput()
 	if err != nil {

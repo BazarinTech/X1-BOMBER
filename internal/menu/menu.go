@@ -43,33 +43,27 @@ func handleBulkRequest(kind string) {
 		return
 	}
 
-	// Payload template example:
-	// Email:/path/to/emails.txt, Password:/path/to/passwords.txt
 	payloadTpl := input.ReadLine("Enter payload template (e.g. Email:/path/emails.txt, Password:/path/passwords.txt):")
 	if payloadTpl == "" || payloadTpl == "exit" {
 		printer.PrintInfo("Cancelled.")
 		return
 	}
 
-	// parse payload template into map[field]filepath
 	fieldFiles, err := parsePayloadTemplate(payloadTpl)
 	if err != nil {
 		printer.PrintError("Invalid payload template: " + err.Error())
 		return
 	}
 
-	// normalize file paths (expand ~) only for non-literals
 	for k, p := range fieldFiles {
 		p = strings.TrimSpace(p)
 		if strings.HasPrefix(p, "\"") && strings.HasSuffix(p, "\"") {
-			// quoted literal, keep as-is
 			fieldFiles[k] = p
 			continue
 		}
 		fieldFiles[k] = filepath.Clean(p)
 	}
 
-	// read wordlists
 	wordlists, minLen, err := input.ReadWordlists(fieldFiles)
 	if err != nil {
 		printer.PrintError("Error reading wordlists: " + err.Error())
@@ -93,14 +87,32 @@ func handleBulkRequest(kind string) {
 		useTor = true
 	}
 
-	// optional headers
-	printer.PrintInfo("Default header: Content-Type: application/json")
+	// Payload type selection
+	printer.PrintInfo("Select payload type:")
+	printer.PrintMenuOption("1", "application/json (default)")
+	printer.PrintMenuOption("2", "application/x-www-form-urlencoded")
+	printer.PrintMenuOption("3", "multipart/form-data")
+	printer.PrintMenuOption("4", "binary (raw file)")
+	printer.PrintMenuOption("5", "GraphQL (JSON query)")
+	payloadChoice := input.ReadLine("Payload type (1-5, default 1):")
+	payloadType := "json"
+	switch payloadChoice {
+	case "2":
+		payloadType = "form"
+	case "3":
+		payloadType = "multipart"
+	case "4":
+		payloadType = "binary"
+	case "5":
+		payloadType = "graphql"
+	}
+
+	printer.PrintInfo("Default header: Content-Type will match payload type automatically")
 	headers := input.ReadHeaders()
 
 	printer.PrintAction("Starting to send requests...")
-	// build payload generator closure
+
 	payloadGen := func(i int) map[string]string {
-		// for each field pick line i % len(list)
 		payload := map[string]string{}
 		for field, list := range wordlists {
 			if len(list) == 0 {
@@ -113,13 +125,12 @@ func handleBulkRequest(kind string) {
 		return payload
 	}
 
-	stats, err := httpclient.SendMultipleRequests("POST", url, headers, payloadGen, count, concurrency, useTor)
+	stats, err := httpclient.SendMultipleRequests("POST", url, headers, payloadGen, count, concurrency, useTor, payloadType)
 	if err != nil {
 		printer.PrintError("Error sending requests: " + err.Error())
 		return
 	}
 
-	// print aggregated summary in required format
 	total := 0
 	successTotal := 0
 	failTotal := 0
@@ -142,7 +153,6 @@ func handleBulkRequest(kind string) {
 }
 
 func parsePayloadTemplate(tpl string) (map[string]string, error) {
-	// tpl: "Email:/path/a.txt, Password:/path/b.txt"
 	out := map[string]string{}
 	parts := strings.Split(tpl, ",")
 	for _, p := range parts {
