@@ -58,8 +58,14 @@ func handleBulkRequest(kind string) {
 		return
 	}
 
-	// normalize file paths (expand ~)
+	// normalize file paths (expand ~) only for non-literals
 	for k, p := range fieldFiles {
+		p = strings.TrimSpace(p)
+		if strings.HasPrefix(p, "\"") && strings.HasSuffix(p, "\"") {
+			// quoted literal, keep as-is
+			fieldFiles[k] = p
+			continue
+		}
 		fieldFiles[k] = filepath.Clean(p)
 	}
 
