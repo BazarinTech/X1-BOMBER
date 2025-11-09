@@ -43,7 +43,7 @@ func handleBulkRequest(kind string) {
 		return
 	}
 
-	payloadTpl := input.ReadLine("Enter payload template (e.g. Email:/path/emails.txt, Password:/path/passwords.txt):")
+	payloadTpl := input.ReadLine("Enter payload template (e.g. Email:/path/emails.txt, Password:/path/passwords.txt, Type:\"login\"):")
 	if payloadTpl == "" || payloadTpl == "exit" {
 		printer.PrintInfo("Cancelled.")
 		return
@@ -55,15 +55,18 @@ func handleBulkRequest(kind string) {
 		return
 	}
 
+	// normalize file paths (expand ~) only for non-literals
 	for k, p := range fieldFiles {
 		p = strings.TrimSpace(p)
 		if strings.HasPrefix(p, "\"") && strings.HasSuffix(p, "\"") {
+			// quoted literal, keep as-is
 			fieldFiles[k] = p
 			continue
 		}
 		fieldFiles[k] = filepath.Clean(p)
 	}
 
+	// read wordlists
 	wordlists, minLen, err := input.ReadWordlists(fieldFiles)
 	if err != nil {
 		printer.PrintError("Error reading wordlists: " + err.Error())
@@ -81,6 +84,10 @@ func handleBulkRequest(kind string) {
 	}
 
 	concurrency := input.ReadIntWithDefault("Concurrency (worker count, default 10)", 10)
+	if concurrency <= 0 {
+		concurrency = 10
+	}
+
 	useTor := false
 	ans := input.ReadLine("Use Tor (SOCKS5 at 127.0.0.1:9050)? (y/N)")
 	if strings.EqualFold(ans, "y") || strings.EqualFold(ans, "yes") {
@@ -110,8 +117,32 @@ func handleBulkRequest(kind string) {
 	printer.PrintInfo("Default header: Content-Type will match payload type automatically")
 	headers := input.ReadHeaders()
 
+	// chunk size (how many jobs per batch)
+	chunkSize := input.ReadIntWithDefault("Chunk size (jobs per batch, default 1000)", 1000)
+	if chunkSize <= 0 {
+		chunkSize = 1000
+	}
+
+	// rate limit (requests per second). 0 = unlimited
+	rateLimit := input.ReadIntWithDefault("Rate limit (requests per second, 0 = unlimited)", 0)
+	if rateLimit < 0 {
+		rateLimit = 0
+	}
+
+	// optional per-request log
+	logPath := ""
+	lAns := input.ReadLine("Write per-request log to CSV? (y/N)")
+	if strings.EqualFold(lAns, "y") || strings.EqualFold(lAns, "yes") {
+		logPath = input.ReadLine("Enter log file path (e.g. ./results.csv):")
+		if logPath == "" || logPath == "exit" {
+			printer.PrintInfo("Cancelled logging; continuing without log.")
+			logPath = ""
+		}
+	}
+
 	printer.PrintAction("Starting to send requests...")
 
+	// build payload generator closure
 	payloadGen := func(i int) map[string]string {
 		payload := map[string]string{}
 		for field, list := range wordlists {
@@ -125,12 +156,26 @@ func handleBulkRequest(kind string) {
 		return payload
 	}
 
-	stats, err := httpclient.SendMultipleRequests("POST", url, headers, payloadGen, count, concurrency, useTor, payloadType)
+	stats, err := httpclient.SendMultipleRequests(
+		"POST",
+		url,
+		headers,
+		payloadGen,
+		count,
+		concurrency,
+		useTor,
+		payloadType,
+		chunkSize,
+		rateLimit,
+		logPath,
+	)
+
 	if err != nil {
 		printer.PrintError("Error sending requests: " + err.Error())
 		return
 	}
 
+	// print aggregated summary in required format
 	total := 0
 	successTotal := 0
 	failTotal := 0
